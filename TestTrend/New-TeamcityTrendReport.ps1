@@ -42,9 +42,25 @@ function New-TeamcityTrendReport {
     .PARAMETER OutputDir
     Output directory where .html / .png / .csv files will be generated.
 
-    .PARAMETER TestNameRegex
+    .PARAMETER TestNameConversionRegex
     Regex for shortening test names, e.g. if test is named 'Category: LongName-TestName', and you provide
     regex 'Category: LongName-(.*)', only 'TestName' will be displayed.
+
+    .PARAMETER TestNameIncludeRegex
+    Regex for filtering tests - only names matching this regex will be included.
+
+    .PARAMETER TestNameExcludeRegex
+    Regex for filtering tests - names matching this regex will be excluded.
+
+    .PARAMETER OutputCsvName
+    Name of output csv file.
+
+    .PARAMETER OutputHtmlName
+    Name of output html file.
+
+    .PARAMETER InputThresholdCsvPath
+    Path to the CSV with test time thresholds - columns TestName,PassedTime,FailedTime.
+    Tests with time <= PassedTime will be marked green, Passed Time < time < FailedTime amber, and time >= FailedTime red.
 
     .PARAMETER NumberOfLastBuilds
     Number of builds that will be trended - all earlier builds will be ignored.
@@ -72,8 +88,28 @@ function New-TeamcityTrendReport {
         $OutputDir,
 
         [Parameter(Mandatory=$false)]
+        [string[]]
+        $TestNameConversionRegex,
+
+        [Parameter(Mandatory=$false)]
         [string]
-        $TestNameRegex,
+        $TestNameIncludeRegex,
+
+        [Parameter(Mandatory=$false)]
+        [string]
+        $TestNameExcludeRegex,
+
+        [Parameter(Mandatory=$false)]
+        [string]
+        $OutputCsvName = 'TestTrendReport.csv',
+
+        [Parameter(Mandatory=$false)]
+        [string]
+        $OutputHtmlName = 'TestTrendReport.html',
+
+        [Parameter(Mandatory=$false)]
+        [string]
+        $InputThresholdCsvPath,
 
         [Parameter(Mandatory=$false)]
         [int]
@@ -82,15 +118,16 @@ function New-TeamcityTrendReport {
         [Parameter(Mandatory=$false)]
         [switch]
         $GenerateCsvFile
-
     )
+
+    $testTimeThresholdData = Get-TestTimeThresholdData -InputThresholdCsvPath $InputThresholdCsvPath
 
     if (!(Test-Path -LiteralPath $OutputDir)) {
         Write-Log -Info "Creating directory '$OutputDir'"
         [void](New-Item -Path $OutputDir -ItemType Directory)
     }
-    $csvOutputPath = Join-Path -Path $OutputDir -ChildPath 'TestTrendReport.csv'
-    $htmlOutputPath = Join-Path -Path $OutputDir -ChildPath 'TestTrendReport.html'
+    $csvOutputPath = Join-Path -Path $OutputDir -ChildPath $OutputCsvName
+    $htmlOutputPath = Join-Path -Path $OutputDir -ChildPath $OutputHtmlName
 
     $sql = Get-TeamCityTrendReportSql
     $sql = $sql -f $TeamcityBuildId, $NumberOfLastBuilds
@@ -107,38 +144,54 @@ function New-TeamcityTrendReport {
     $buildIdData = $sqlResult[0]
     $trendData = $sqlResult[1]
 
+    if ($TestNameConversionRegex) {
+        foreach ($entry in $trendData) {
+            foreach ($regex in $TestNameConversionRegex) { 
+                if ($entry.test_name -imatch $regex -and $matches[1]) {
+                    $entry.test_name = $matches[1]
+                }
+            }
+        }
+    }
+
+    if ($TestNameIncludeRegex) {
+        $trendData = $trendData | Where-Object { $_.test_name -imatch $TestNameIncludeRegex }
+    }
+    if ($TestNameExcludeRegex) {
+        $trendData = $trendData | Where-Object { $_.test_name -inotmatch $TestNameExcludeRegex }
+    }
+
     $buildIdMap = @{}
     foreach ($row in $buildIdData) { 
         $buildIdMap[[string]($row.build_id)] = $row 
     }
-    if ($TestNameRegex) {
-        foreach ($entry in $trendData) {
-            if ($entry.test_name -imatch $TestNameRegex -and $matches[1]) {
-                $entry.test_name = $matches[1]
-            }
-        }
-    }
+
 
     Write-Log -Info "Generating html report"
     if ($GenerateCsvFile) {
         ConvertTo-CsvInBuildNameOrder -BuildIdMap $buildIdMap -TrendData $trendData -CsvOutputPath $csvOutputPath
     }
 
-    $htmlChartData = $trendData | ConvertTo-EnhancedHTMLFragmentJavascriptData -JavascriptVariableName 'TestData' -PropertySeriesName 'test_name' -BuildIdMap $buildIdMap `
+    $htmlChartData = $trendData | ConvertTo-EnhancedHTMLFragmentRickshawJavascriptData -JavascriptVariableName 'TestData' -PropertySeriesName 'test_name' -BuildIdMap $buildIdMap `
         -PrefixCode "var palette = new Rickshaw.Color.Palette({ scheme: 'munin' } );"
 
-    $htmlChart = ConvertTo-EnhancedHTMLFragmentRickshawChart -JavascriptDataVariableName 'TestData'
+    $htmlTestTimeThresholdData = $testTimeThresholdData | ConvertTo-EnhancedHTMLFragmentJavascriptHashtable -JavascriptVariableName 'TestTimeThresholdData'
 
-    $javascriptUri= @('http://code.jquery.com/jquery-1.10.2.min.js', 'http://cdn.datatables.net/1.10.0/js/jquery.dataTables.min.js', `
-        'http://cdnjs.cloudflare.com/ajax/libs/d3/3.4.11/d3.min.js', 'https://code.jquery.com/ui/1.11.0/jquery-ui.min.js', 
-        'http://cdnjs.cloudflare.com/ajax/libs/rickshaw/1.4.6/rickshaw.min.js')
+    $htmlChart = ConvertTo-EnhancedHTMLFragmentRickshawChart -JavascriptDataVariableName 'TestData' -JavascriptTestTimeThresholdDataVariableName 'TestTimeThresholdData'
+
+    $javascriptUri= @('https://code.jquery.com/jquery-1.11.3.min.js', 'https://cdn.datatables.net/1.10.9/js/jquery.dataTables.min.js',
+        'https://cdn.datatables.net/fixedcolumns/3.1.0/js/dataTables.fixedColumns.min.js',
+        'https://cdnjs.cloudflare.com/ajax/libs/d3/3.5.6/d3.min.js', 'https://code.jquery.com/ui/1.11.4/jquery-ui.min.js', 
+        'https://cdnjs.cloudflare.com/ajax/libs/rickshaw/1.5.1/rickshaw.min.js')
 
     Write-Log -Info "Generating Test Trend HTML report at '$htmlOutputPath'."
 
-    $params = @{'HTMLFragments' = @($htmlChartData, $htmlChart);
+    $params = @{'HTMLFragments' = @($htmlChartData, $htmlTestTimeThresholdData, $htmlChart);
                 'JavascriptUri' = $javascriptUri;
                 'CssStyleSheet' = @((Get-DefaultJqueryDataTableCss), (Get-DefaultRickshawCss));
-                'CssUri' = @('http://cdn.datatables.net/1.10.0/css/jquery.dataTables.css', 'http://ajax.googleapis.com/ajax/libs/jqueryui/1.8/themes/base/jquery-ui.css')
+                'CssUri' = @('https://cdn.datatables.net/1.10.9/css/jquery.dataTables.css', 
+                    'https://cdn.datatables.net/fixedcolumns/3.1.0/css/fixedColumns.dataTables.min.css',
+                    'https://ajax.googleapis.com/ajax/libs/jqueryui/1.11.4/themes/smoothness/jquery-ui.min.css')
                }
 
     ConvertTo-EnhancedHTML @params | Out-File -FilePath $htmlOutputPath -Encoding UTF8
@@ -217,36 +270,39 @@ function Get-TeamCityTrendReportSql {
         @query  AS NVARCHAR(MAX)
 
     if object_id('tempdb..#builds') is not null
-	    drop table #builds;
+        drop table #builds;
 
     if object_id('tempdb..#tests') is not null
-	    drop table #tests;
+        drop table #tests;
 
     select top {1}
         build_id,
         build_number,
-        cast(row_number() over (partition by build_number order by build_number) as varchar) as build_row,
-		count(build_number) over (partition by build_number order by build_number) non_distinct_build_numbers,
+--        cast(row_number() over (partition by build_number order by build_number) as varchar) as build_row,
+--        count(build_number) over (partition by build_number order by build_number) non_distinct_build_numbers,
+-- JKu, 2025-01-14, fix for error "ORDER BY list of RANGE window frame has total size of 1024 bytes. Largest size supported is 900 bytes."
+        cast(row_number() over (partition by build_number order by cast(build_number as nvarchar(450))) as varchar) as build_row,
+        count(build_number) over (partition by build_number order by cast(build_number as nvarchar(450))) non_distinct_build_numbers,
         success
     into
-	    #builds
+        #builds
     from (
         select
-		    build_id, 
-		    build_number,
+            build_id, 
+            build_number,
             cast(1 as bit) as success
-	    from
-		    dbo.running r
-	    where 
-		    build_id = {0}
-	    union all
-	    select
-	        h.build_id, 
-		    h.build_number,
+        from
+            dbo.running r
+        where 
+            build_id = {0}
+        union all
+        select
+            h.build_id, 
+            h.build_number,
             cast(case when h.status = 1 then 1 else 0 end as bit) as success
-	    from
-		    dbo.history h
-	    inner join
+        from
+            dbo.history h
+        inner join
             (select 
                 build_type_id
              from
@@ -260,41 +316,41 @@ function Get-TeamCityTrendReportSql {
                 dbo.history
              where
                 build_id = {0}
-	       ) currentBuild
-	    on currentBuild.build_type_id = h.build_type_id
+           ) currentBuild
+        on currentBuild.build_type_id = h.build_type_id
         where
             h.status <> 0 -- cancelled
     ) x
     where 
-		exists (select 1 from dbo.test_info where build_id = x.build_id)
+        exists (select 1 from dbo.test_info where build_id = x.build_id)
     order by 
-		build_id desc;
+        build_id desc;
 
     select
-		build_id,
-		case when non_distinct_build_numbers = 1 then b.build_number else b.build_number + '_' + build_row end build_number,
-		success
-	from
-		#builds b
+        build_id,
+        case when non_distinct_build_numbers = 1 then b.build_number else b.build_number + '_' + build_row end build_number,
+        success
+    from
+        #builds b
 
-	select
-		b.build_id,
-		tn.test_name,
-		ti.duration
-	into
-		#tests
-	from
-		#builds b
-	inner join
-	    dbo.test_info ti
-	on ti.build_id = b.build_id
-	inner join
-		dbo.test_names tn
-	on tn.id = ti.test_name_id
-	/*inner join
-		dbo.test_info tiFilter
-	on  tiFilter.test_name_id = tn.id
-	and tiFilter.build_id = (select top 1 build_id from #builds order by build_id desc)*/
+    select
+        b.build_id,
+        tn.test_name,
+        ti.duration
+    into
+        #tests
+    from
+        #builds b
+    inner join
+        dbo.test_info ti
+    on ti.build_id = b.build_id
+    inner join
+        dbo.test_names tn
+    on tn.id = ti.test_name_id
+    /*inner join
+        dbo.test_info tiFilter
+    on  tiFilter.test_name_id = tn.id
+    and tiFilter.build_id = (select top 1 build_id from #builds order by build_id desc)*/
     where
         ti.status <> 0 -- ignored tests
 
@@ -306,7 +362,7 @@ function Get-TeamCityTrendReportSql {
                 ).value('.', 'NVARCHAR(MAX)') 
             ,1,1,'')
 
-	
+    
     set @query = 'select test_name, ' + @cols + '
                   from 
                  (
